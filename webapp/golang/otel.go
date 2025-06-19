@@ -13,7 +13,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func initTracerProvider(ctx context.Context) (func(context.Context) error, error) {
@@ -57,7 +56,6 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 func initMetricProvider(ctx context.Context) (func(context.Context) error, error) {
 	exporter, err := otlpmetricgrpc.New(ctx,
 		otlpmetricgrpc.WithEndpoint("otlp.mackerelio.com:4317"),
-		otlpmetricgrpc.WithTLSCredentials(insecure.NewCredentials()),
 		otlpmetricgrpc.WithHeaders(map[string]string{
 			"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
 		}),

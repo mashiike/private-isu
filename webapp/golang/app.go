@@ -361,6 +361,16 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
 func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tracer := otel.Tracer("private-isu")
@@ -375,19 +385,25 @@ func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 		
 		start := time.Now()
 		
-		handler(w, r.WithContext(ctx))
+		rw := &responseWriter{ResponseWriter: w, statusCode: 200}
+		handler(rw, r.WithContext(ctx))
 		
 		duration := time.Since(start).Seconds()
 		httpRequestsCounter.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("method", r.Method),
-			attribute.String("endpoint", endpoint),
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", endpoint),
+			attribute.Int("http.response.status_code", rw.statusCode),
 		))
 		httpRequestsDuration.Record(ctx, duration, metric.WithAttributes(
-			attribute.String("method", r.Method),
-			attribute.String("endpoint", endpoint),
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", endpoint),
+			attribute.Int("http.response.status_code", rw.statusCode),
 		))
 		
-		span.SetAttributes(attribute.Float64("http.duration", duration))
+		span.SetAttributes(
+			attribute.Float64("http.duration", duration),
+			attribute.Int("http.response.status_code", rw.statusCode),
+		)
 	}
 }
 
