@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"database/sql"
 	"fmt"
 	"html/template"
 	"io"
@@ -34,6 +35,8 @@ var (
 	
 	httpRequestsCounter   metric.Int64Counter
 	httpRequestsDuration  metric.Float64Histogram
+	dbQueryCounter        metric.Int64Counter
+	dbQueryDuration       metric.Float64Histogram
 )
 
 const (
@@ -84,6 +87,7 @@ func init() {
 }
 
 func dbInitialize() {
+	ctx := context.Background()
 	sqls := []string{
 		"DELETE FROM users WHERE id > 1000",
 		"DELETE FROM posts WHERE id > 10000",
@@ -93,13 +97,13 @@ func dbInitialize() {
 	}
 
 	for _, sql := range sqls {
-		db.Exec(sql)
+		instrumentedDBExec(ctx, sql)
 	}
 }
 
-func tryLogin(accountName, password string) *User {
+func tryLogin(ctx context.Context, accountName, password string) *User {
 	u := User{}
-	err := db.Get(&u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
+	err := instrumentedDBGet(ctx, &u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
 	if err != nil {
 		return nil
 	}
@@ -149,6 +153,7 @@ func getSession(r *http.Request) *sessions.Session {
 }
 
 func getSessionUser(r *http.Request) User {
+	ctx := r.Context()
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
 	if !ok || uid == nil {
@@ -157,7 +162,7 @@ func getSessionUser(r *http.Request) User {
 
 	u := User{}
 
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	err := instrumentedDBGet(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
 	}
@@ -178,11 +183,15 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(ctx, "makePosts")
+	defer span.End()
+	
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		err := instrumentedDBGet(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -192,13 +201,13 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			query += " LIMIT 3"
 		}
 		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+		err = instrumentedDBSelect(ctx, &comments, query, p.ID)
 		if err != nil {
 			return nil, err
 		}
 
 		for i := range comments {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			err := instrumentedDBGet(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
 			if err != nil {
 				return nil, err
 			}
@@ -211,7 +220,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		err = instrumentedDBGet(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +234,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			break
 		}
 	}
-
+	
+	span.SetAttributes(attribute.Int("posts.count", len(posts)))
 	return posts, nil
 }
 
@@ -263,25 +273,121 @@ func secureRandomStr(b int) string {
 	return fmt.Sprintf("%x", k)
 }
 
+func instrumentedDBGet(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(ctx, "db.Get")
+	defer span.End()
+	
+	span.SetAttributes(
+		attribute.String("db.statement", query),
+		attribute.String("db.operation", "SELECT"),
+	)
+	
+	start := time.Now()
+	err := db.Get(dest, query, args...)
+	duration := time.Since(start).Seconds()
+	
+	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("db.operation", "SELECT"),
+	))
+	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
+		attribute.String("db.operation", "SELECT"),
+	))
+	
+	if err != nil {
+		span.SetAttributes(attribute.String("db.error", err.Error()))
+	}
+	
+	return err
+}
+
+func instrumentedDBSelect(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(ctx, "db.Select")
+	defer span.End()
+	
+	span.SetAttributes(
+		attribute.String("db.statement", query),
+		attribute.String("db.operation", "SELECT"),
+	)
+	
+	start := time.Now()
+	err := db.Select(dest, query, args...)
+	duration := time.Since(start).Seconds()
+	
+	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("db.operation", "SELECT"),
+	))
+	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
+		attribute.String("db.operation", "SELECT"),
+	))
+	
+	if err != nil {
+		span.SetAttributes(attribute.String("db.error", err.Error()))
+	}
+	
+	return err
+}
+
+func instrumentedDBExec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(ctx, "db.Exec")
+	defer span.End()
+	
+	span.SetAttributes(
+		attribute.String("db.statement", query),
+		attribute.String("db.operation", "EXEC"),
+	)
+	
+	start := time.Now()
+	result, err := db.Exec(query, args...)
+	duration := time.Since(start).Seconds()
+	
+	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("db.operation", "EXEC"),
+	))
+	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
+		attribute.String("db.operation", "EXEC"),
+	))
+	
+	if err != nil {
+		span.SetAttributes(attribute.String("db.error", err.Error()))
+	}
+	
+	return result, err
+}
+
 func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
 func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		tracer := otel.Tracer("private-isu")
+		ctx, span := tracer.Start(r.Context(), endpoint)
+		defer span.End()
+		
+		span.SetAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", endpoint),
+			attribute.String("http.url", r.URL.String()),
+		)
+		
 		start := time.Now()
 		
-		handler(w, r)
+		handler(w, r.WithContext(ctx))
 		
 		duration := time.Since(start).Seconds()
-		httpRequestsCounter.Add(r.Context(), 1, metric.WithAttributes(
+		httpRequestsCounter.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("method", r.Method),
 			attribute.String("endpoint", endpoint),
 		))
-		httpRequestsDuration.Record(r.Context(), duration, metric.WithAttributes(
+		httpRequestsDuration.Record(ctx, duration, metric.WithAttributes(
 			attribute.String("method", r.Method),
 			attribute.String("endpoint", endpoint),
 		))
+		
+		span.SetAttributes(attribute.Float64("http.duration", duration))
 	}
 }
 
@@ -313,7 +419,8 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := tryLogin(r.FormValue("account_name"), r.FormValue("password"))
+	ctx := r.Context()
+	u := tryLogin(ctx, r.FormValue("account_name"), r.FormValue("password"))
 
 	if u != nil {
 		session := getSession(r)
@@ -364,9 +471,10 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
 	exists := 0
 	// ユーザーが存在しない場合はエラーになるのでエラーチェックはしない
-	db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
+	instrumentedDBGet(ctx, &exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
 
 	if exists == 1 {
 		session := getSession(r)
@@ -378,7 +486,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := db.Exec(query, accountName, calculatePasshash(accountName, password))
+	result, err := instrumentedDBExec(ctx, query, accountName, calculatePasshash(accountName, password))
 	if err != nil {
 		log.Print(err)
 		return
@@ -407,17 +515,21 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(r.Context(), "getIndex")
+	defer span.End()
+	
 	me := getSessionUser(r)
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := instrumentedDBSelect(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		return
@@ -441,10 +553,14 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(r.Context(), "getAccountName")
+	defer span.End()
+	
 	accountName := r.PathValue("accountName")
 	user := User{}
 
-	err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
+	err := instrumentedDBGet(ctx, &user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
 	if err != nil {
 		log.Print(err)
 		return
@@ -457,27 +573,27 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = instrumentedDBSelect(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
 	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	err = instrumentedDBGet(ctx, &commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
 	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	err = instrumentedDBSelect(ctx, &postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -498,7 +614,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 			args[i] = v
 		}
 
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+		err = instrumentedDBGet(ctx, &commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
 		if err != nil {
 			log.Print(err)
 			return
@@ -527,6 +643,10 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(r.Context(), "getPosts")
+	defer span.End()
+	
 	m, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -545,13 +665,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = instrumentedDBSelect(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		return
@@ -573,6 +693,10 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(r.Context(), "getPostsID")
+	defer span.End()
+	
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -581,13 +705,13 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = instrumentedDBSelect(ctx, &results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), true)
 	if err != nil {
 		log.Print(err)
 		return
@@ -617,6 +741,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/login", http.StatusFound)
@@ -674,7 +799,8 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
-	result, err := db.Exec(
+	result, err := instrumentedDBExec(
+		ctx,
 		query,
 		me.ID,
 		mime,
@@ -696,6 +822,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -704,7 +831,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = instrumentedDBGet(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -728,6 +855,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/login", http.StatusFound)
@@ -746,7 +874,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
+	_, err = instrumentedDBExec(ctx, query, postID, me.ID, r.FormValue("comment"))
 	if err != nil {
 		log.Print(err)
 		return
@@ -756,6 +884,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 }
 
 func getAdminBanned(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -768,7 +897,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	users := []User{}
-	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
+	err := instrumentedDBSelect(ctx, &users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -785,6 +914,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 }
 
 func postAdminBanned(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -810,7 +940,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, id := range r.Form["uid[]"] {
-		db.Exec(query, 1, id)
+		instrumentedDBExec(ctx, query, 1, id)
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
@@ -837,6 +967,14 @@ func main() {
 	httpRequestsDuration, err = meter.Float64Histogram("http_request_duration_seconds", metric.WithDescription("HTTP request duration in seconds"))
 	if err != nil {
 		log.Fatalf("Failed to create http_request_duration_seconds histogram: %s", err.Error())
+	}
+	dbQueryCounter, err = meter.Int64Counter("db_queries_total", metric.WithDescription("Total number of database queries"))
+	if err != nil {
+		log.Fatalf("Failed to create db_queries_total counter: %s", err.Error())
+	}
+	dbQueryDuration, err = meter.Float64Histogram("db_query_duration_seconds", metric.WithDescription("Database query duration in seconds"))
+	if err != nil {
+		log.Fatalf("Failed to create db_query_duration_seconds histogram: %s", err.Error())
 	}
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
