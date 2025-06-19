@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"fmt"
 	"html/template"
@@ -22,11 +23,17 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+	
+	httpRequestsCounter   metric.Int64Counter
+	httpRequestsDuration  metric.Float64Histogram
 )
 
 const (
@@ -258,6 +265,24 @@ func secureRandomStr(b int) string {
 
 func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
+}
+
+func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		handler(w, r)
+		
+		duration := time.Since(start).Seconds()
+		httpRequestsCounter.Add(r.Context(), 1, metric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("endpoint", endpoint),
+		))
+		httpRequestsDuration.Record(r.Context(), duration, metric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("endpoint", endpoint),
+		))
+	}
 }
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
@@ -792,6 +817,27 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	ctx := context.Background()
+	shutdownTracer, err := initTracerProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize tracer provider: %s", err.Error())
+	}
+	defer shutdownTracer(ctx)
+	shutdownMetric, err := initMetricProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize metric provider: %s", err.Error())
+	}
+	defer shutdownMetric(ctx)
+	
+	meter := otel.Meter("private-isu")
+	httpRequestsCounter, err = meter.Int64Counter("http_requests_total", metric.WithDescription("Total number of HTTP requests"))
+	if err != nil {
+		log.Fatalf("Failed to create http_requests_total counter: %s", err.Error())
+	}
+	httpRequestsDuration, err = meter.Float64Histogram("http_request_duration_seconds", metric.WithDescription("HTTP request duration in seconds"))
+	if err != nil {
+		log.Fatalf("Failed to create http_request_duration_seconds histogram: %s", err.Error())
+	}
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -800,7 +846,7 @@ func main() {
 	if port == "" {
 		port = "3306"
 	}
-	_, err := strconv.Atoi(port)
+	_, err = strconv.Atoi(port)
 	if err != nil {
 		log.Fatalf("Failed to read DB port number from an environment variable ISUCONP_DB_PORT.\nError: %s", err.Error())
 	}
@@ -837,21 +883,21 @@ func main() {
 
 	r := chi.NewRouter()
 
-	r.Get("/initialize", getInitialize)
-	r.Get("/login", getLogin)
-	r.Post("/login", postLogin)
-	r.Get("/register", getRegister)
-	r.Post("/register", postRegister)
-	r.Get("/logout", getLogout)
-	r.Get("/", getIndex)
-	r.Get("/posts", getPosts)
-	r.Get("/posts/{id}", getPostsID)
-	r.Post("/", postIndex)
-	r.Get("/image/{id}.{ext}", getImage)
-	r.Post("/comment", postComment)
-	r.Get("/admin/banned", getAdminBanned)
-	r.Post("/admin/banned", postAdminBanned)
-	r.Get(`/@{accountName:[a-zA-Z]+}`, getAccountName)
+	r.Get("/initialize", recordMetrics(getInitialize, "/initialize"))
+	r.Get("/login", recordMetrics(getLogin, "/login"))
+	r.Post("/login", recordMetrics(postLogin, "/login"))
+	r.Get("/register", recordMetrics(getRegister, "/register"))
+	r.Post("/register", recordMetrics(postRegister, "/register"))
+	r.Get("/logout", recordMetrics(getLogout, "/logout"))
+	r.Get("/", recordMetrics(getIndex, "/"))
+	r.Get("/posts", recordMetrics(getPosts, "/posts"))
+	r.Get("/posts/{id}", recordMetrics(getPostsID, "/posts/{id}"))
+	r.Post("/", recordMetrics(postIndex, "/"))
+	r.Get("/image/{id}.{ext}", recordMetrics(getImage, "/image/{id}.{ext}"))
+	r.Post("/comment", recordMetrics(postComment, "/comment"))
+	r.Get("/admin/banned", recordMetrics(getAdminBanned, "/admin/banned"))
+	r.Post("/admin/banned", recordMetrics(postAdminBanned, "/admin/banned"))
+	r.Get(`/@{accountName:[a-zA-Z]+}`, recordMetrics(getAccountName, "/@{accountName}"))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		http.FileServerFS(root.FS()).ServeHTTP(w, r)
 	})
