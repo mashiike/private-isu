@@ -33,14 +33,10 @@ var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
 
-	httpRequestsCounter    metric.Int64Counter
-	httpRequestsDuration   metric.Float64Histogram
-	dbQueryCounter         metric.Int64Counter
-	dbQueryDuration        metric.Float64Histogram
-	authAttemptsCounter    metric.Int64Counter
-	sessionOperationsCounter metric.Int64Counter
-	fileOperationsCounter  metric.Int64Counter
-	fileOperationsSizeHistogram metric.Int64Histogram
+	httpRequestsCounter  metric.Int64Counter
+	httpRequestsDuration metric.Float64Histogram
+	dbQueryCounter       metric.Int64Counter
+	dbQueryDuration      metric.Float64Histogram
 )
 
 const (
@@ -106,30 +102,15 @@ func dbInitialize() {
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
-	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(ctx, "tryLogin")
-	defer span.End()
-
-	span.SetAttributes(
-		attribute.String("auth.account_name", accountName),
-	)
 	u := User{}
 	err := instrumentedDBGet(ctx, &u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
 	if err != nil {
 		return nil
 	}
 
-	if calculatePasshash(ctx, u.AccountName, password) == u.Passhash {
-		authAttemptsCounter.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("auth.result", "success"),
-		))
-		span.SetAttributes(attribute.String("auth.result", "success"))
+	if calculatePasshash(u.AccountName, password) == u.Passhash {
 		return &u
 	} else {
-		authAttemptsCounter.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("auth.result", "failure"),
-		))
-		span.SetAttributes(attribute.String("auth.result", "failure"))
 		return nil
 	}
 }
@@ -146,97 +127,38 @@ func escapeshellarg(arg string) string {
 	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
 }
 
-func digest(ctx context.Context, src string) string {
-	tracer := otel.Tracer("private-isu")
-	_, span := tracer.Start(ctx, "digest")
-	defer span.End()
-
-	span.SetAttributes(
-		attribute.String("crypto.operation", "sha512"),
-	)
+func digest(src string) string {
 	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	start := time.Now()
 	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	duration := time.Since(start)
-	
-	span.SetAttributes(
-		attribute.Float64("crypto.duration_ms", float64(duration.Nanoseconds())/1e6),
-	)
-	
 	if err != nil {
-		span.RecordError(err)
-		span.SetAttributes(attribute.String("crypto.result", "error"))
 		log.Print(err)
 		return ""
 	}
-	
-	span.SetAttributes(attribute.String("crypto.result", "success"))
+
 	return strings.TrimSuffix(string(out), "\n")
 }
 
-func calculateSalt(ctx context.Context, accountName string) string {
-	return digest(ctx, accountName)
+func calculateSalt(accountName string) string {
+	return digest(accountName)
 }
 
-func calculatePasshash(ctx context.Context, accountName, password string) string {
-	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(ctx, "calculatePasshash")
-	defer span.End()
-	
-	span.SetAttributes(
-		attribute.String("auth.account_name", accountName),
-	)
-	
-	return digest(ctx, password + ":" + calculateSalt(ctx, accountName))
+func calculatePasshash(accountName, password string) string {
+	return digest(password + ":" + calculateSalt(accountName))
 }
 
 func getSession(r *http.Request) *sessions.Session {
-	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(r.Context(), "getSession")
-	defer span.End()
-	start := time.Now()
-	session, err := store.Get(r, "isuconp-go.session")
-	duration := time.Since(start)
-	
-	sessionOperationsCounter.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("session.operation", "get"),
-		attribute.String("session.result", func() string {
-			if err != nil {
-				return "error"
-			}
-			return "success"
-		}()),
-	))
-	
-	span.SetAttributes(
-		attribute.String("session.operation", "get"),
-		attribute.Float64("session.duration_ms", float64(duration.Nanoseconds())/1e6),
-	)
-	
-	if err != nil {
-		span.RecordError(err)
-	}
-	
+	session, _ := store.Get(r, "isuconp-go.session")
+
 	return session
 }
 
 func getSessionUser(r *http.Request) User {
-	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(r.Context(), "getSessionUser")
-	defer span.End()
+	ctx := r.Context()
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
 	if !ok || uid == nil {
-		span.SetAttributes(
-			attribute.String("session.user_found", "false"),
-		)
 		return User{}
 	}
-	
-	span.SetAttributes(
-		attribute.String("session.user_found", "true"),
-		attribute.Int("session.user_id", uid.(int)),
-	)
 
 	u := User{}
 
@@ -587,7 +509,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := instrumentedDBExec(ctx, query, accountName, calculatePasshash(ctx, accountName, password))
+	result, err := instrumentedDBExec(ctx, query, accountName, calculatePasshash(accountName, password))
 	if err != nil {
 		log.Print(err)
 		return
@@ -899,15 +821,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileOperationsCounter.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("file.operation", "upload"),
-		attribute.String("file.mime_type", mime),
-	))
-	fileOperationsSizeHistogram.Record(ctx, int64(len(filedata)), metric.WithAttributes(
-		attribute.String("file.operation", "upload"),
-		attribute.String("file.mime_type", mime),
-	))
-	
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := instrumentedDBExec(
 		ctx,
@@ -932,9 +845,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
-	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(r.Context(), "getImage")
-	defer span.End()
+	ctx := r.Context()
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -954,25 +865,9 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
-		fileOperationsCounter.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("file.operation", "serve"),
-			attribute.String("file.mime_type", post.Mime),
-		))
-		fileOperationsSizeHistogram.Record(ctx, int64(len(post.Imgdata)), metric.WithAttributes(
-			attribute.String("file.operation", "serve"),
-			attribute.String("file.mime_type", post.Mime),
-		))
-		
-		span.SetAttributes(
-			attribute.String("image.mime_type", post.Mime),
-			attribute.Int("image.size_bytes", len(post.Imgdata)),
-			attribute.Int("image.post_id", post.ID),
-		)
-		
 		w.Header().Set("Content-Type", post.Mime)
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
-			span.RecordError(err)
 			log.Print(err)
 			return
 		}
@@ -1103,23 +998,6 @@ func main() {
 	dbQueryDuration, err = meter.Float64Histogram("db_query_duration_seconds", metric.WithDescription("Database query duration in seconds"))
 	if err != nil {
 		log.Fatalf("Failed to create db_query_duration_seconds histogram: %s", err.Error())
-	}
-	
-	authAttemptsCounter, err = meter.Int64Counter("auth_attempts_total", metric.WithDescription("Total number of authentication attempts"))
-	if err != nil {
-		log.Fatalf("Failed to create auth_attempts_total counter: %s", err.Error())
-	}
-	sessionOperationsCounter, err = meter.Int64Counter("session_operations_total", metric.WithDescription("Total number of session operations"))
-	if err != nil {
-		log.Fatalf("Failed to create session_operations_total counter: %s", err.Error())
-	}
-	fileOperationsCounter, err = meter.Int64Counter("file_operations_total", metric.WithDescription("Total number of file operations"))
-	if err != nil {
-		log.Fatalf("Failed to create file_operations_total counter: %s", err.Error())
-	}
-	fileOperationsSizeHistogram, err = meter.Int64Histogram("file_operations_size_bytes", metric.WithDescription("File operation size in bytes"))
-	if err != nil {
-		log.Fatalf("Failed to create file_operations_size_bytes histogram: %s", err.Error())
 	}
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
