@@ -26,6 +26,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -482,6 +483,14 @@ func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 			attribute.Float64("http.duration", duration),
 			attribute.Int("http.response.status_code", rw.statusCode),
 		)
+		
+		// Mark span as error for 5xx status codes
+		if rw.statusCode >= 500 {
+			err := fmt.Errorf("HTTP %d error", rw.statusCode)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", rw.statusCode))
+		}
+		
 		select {
 		case <-ctx.Done():
 			span.RecordError(ctx.Err())
