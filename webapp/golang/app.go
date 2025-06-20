@@ -32,11 +32,11 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
-	
-	httpRequestsCounter   metric.Int64Counter
-	httpRequestsDuration  metric.Float64Histogram
-	dbQueryCounter        metric.Int64Counter
-	dbQueryDuration       metric.Float64Histogram
+
+	httpRequestsCounter  metric.Int64Counter
+	httpRequestsDuration metric.Float64Histogram
+	dbQueryCounter       metric.Int64Counter
+	dbQueryDuration      metric.Float64Histogram
 )
 
 const (
@@ -187,7 +187,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(ctx, "makePosts")
 	defer span.End()
-	
+
 	var posts []Post
 
 	for _, p := range results {
@@ -234,7 +234,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			break
 		}
 	}
-	
+
 	span.SetAttributes(attribute.Int("posts.count", len(posts)))
 	return posts, nil
 }
@@ -277,27 +277,27 @@ func instrumentedDBGet(ctx context.Context, dest interface{}, query string, args
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(ctx, "db.Get")
 	defer span.End()
-	
+
 	span.SetAttributes(
 		attribute.String("db.statement", query),
 		attribute.String("db.operation", "SELECT"),
 	)
-	
+
 	start := time.Now()
 	err := db.Get(dest, query, args...)
 	duration := time.Since(start).Seconds()
-	
+
 	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("db.operation", "SELECT"),
 	))
 	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
 		attribute.String("db.operation", "SELECT"),
 	))
-	
+
 	if err != nil {
 		span.SetAttributes(attribute.String("db.error", err.Error()))
 	}
-	
+
 	return err
 }
 
@@ -305,27 +305,27 @@ func instrumentedDBSelect(ctx context.Context, dest interface{}, query string, a
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(ctx, "db.Select")
 	defer span.End()
-	
+
 	span.SetAttributes(
 		attribute.String("db.statement", query),
 		attribute.String("db.operation", "SELECT"),
 	)
-	
+
 	start := time.Now()
 	err := db.Select(dest, query, args...)
 	duration := time.Since(start).Seconds()
-	
+
 	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("db.operation", "SELECT"),
 	))
 	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
 		attribute.String("db.operation", "SELECT"),
 	))
-	
+
 	if err != nil {
 		span.SetAttributes(attribute.String("db.error", err.Error()))
 	}
-	
+
 	return err
 }
 
@@ -333,27 +333,27 @@ func instrumentedDBExec(ctx context.Context, query string, args ...interface{}) 
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(ctx, "db.Exec")
 	defer span.End()
-	
+
 	span.SetAttributes(
 		attribute.String("db.statement", query),
 		attribute.String("db.operation", "EXEC"),
 	)
-	
+
 	start := time.Now()
 	result, err := db.Exec(query, args...)
 	duration := time.Since(start).Seconds()
-	
+
 	dbQueryCounter.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("db.operation", "EXEC"),
 	))
 	dbQueryDuration.Record(ctx, duration, metric.WithAttributes(
 		attribute.String("db.operation", "EXEC"),
 	))
-	
+
 	if err != nil {
 		span.SetAttributes(attribute.String("db.error", err.Error()))
 	}
-	
+
 	return result, err
 }
 
@@ -376,18 +376,18 @@ func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 		tracer := otel.Tracer("private-isu")
 		ctx, span := tracer.Start(r.Context(), endpoint)
 		defer span.End()
-		
+
 		span.SetAttributes(
 			attribute.String("http.method", r.Method),
 			attribute.String("http.route", endpoint),
 			attribute.String("http.url", r.URL.String()),
 		)
-		
+
 		start := time.Now()
-		
+
 		rw := &responseWriter{ResponseWriter: w, statusCode: 200}
 		handler(rw, r.WithContext(ctx))
-		
+
 		duration := time.Since(start).Seconds()
 		httpRequestsCounter.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("http.method", r.Method),
@@ -399,11 +399,18 @@ func recordMetrics(handler http.HandlerFunc, endpoint string) http.HandlerFunc {
 			attribute.String("http.route", endpoint),
 			attribute.Int("http.response.status_code", rw.statusCode),
 		))
-		
+
 		span.SetAttributes(
 			attribute.Float64("http.duration", duration),
 			attribute.Int("http.response.status_code", rw.statusCode),
 		)
+		select {
+		case <-ctx.Done():
+			span.RecordError(ctx.Err())
+			return
+		default:
+			// continue
+		}
 	}
 }
 
@@ -534,7 +541,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(r.Context(), "getIndex")
 	defer span.End()
-	
+
 	me := getSessionUser(r)
 
 	results := []Post{}
@@ -572,7 +579,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(r.Context(), "getAccountName")
 	defer span.End()
-	
+
 	accountName := r.PathValue("accountName")
 	user := User{}
 
@@ -662,7 +669,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(r.Context(), "getPosts")
 	defer span.End()
-	
+
 	m, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -712,7 +719,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	tracer := otel.Tracer("private-isu")
 	ctx, span := tracer.Start(r.Context(), "getPostsID")
 	defer span.End()
-	
+
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -974,7 +981,7 @@ func main() {
 		log.Fatalf("Failed to initialize metric provider: %s", err.Error())
 	}
 	defer shutdownMetric(ctx)
-	
+
 	meter := otel.Meter("private-isu")
 	httpRequestsCounter, err = meter.Int64Counter("http_requests_total", metric.WithDescription("Total number of HTTP requests"))
 	if err != nil {
