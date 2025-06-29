@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
+	"strconv"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -43,9 +45,30 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 		return nil, err
 	}
 
+	// サンプリング率を環境変数から取得（デフォルト10%）
+	samplingRate := 0.1
+	if rateStr := os.Getenv("OTEL_TRACE_SAMPLING_RATE"); rateStr != "" {
+		if rate, err := strconv.ParseFloat(rateStr, 64); err == nil && rate >= 0.0 && rate <= 1.0 {
+			samplingRate = rate
+		} else {
+			log.Printf("Warning: Invalid OTEL_TRACE_SAMPLING_RATE value '%s', using default 0.1", rateStr)
+		}
+	}
+
+	// ペアレントベースサンプリング設定
+	// ペアレントがある場合は常にトレース、ない場合はサンプリングしない
+	sampler := trace.ParentBased(
+		trace.TraceIDRatioBased(samplingRate), // 環境変数で設定可能なサンプリング率
+		trace.WithRemoteParentSampled(trace.AlwaysSample()),    // リモートペアレントがサンプルされている場合は常にサンプル
+		trace.WithRemoteParentNotSampled(trace.NeverSample()),  // リモートペアレントがサンプルされていない場合はサンプルしない
+		trace.WithLocalParentSampled(trace.AlwaysSample()),     // ローカルペアレントがサンプルされている場合は常にサンプル
+		trace.WithLocalParentNotSampled(trace.NeverSample()),   // ローカルペアレントがサンプルされていない場合はサンプルしない
+	)
+
 	tp := trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
 		trace.WithResource(resources),
+		trace.WithSampler(sampler),
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
