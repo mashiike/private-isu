@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -22,20 +23,30 @@ import (
 func initTracerProvider(ctx context.Context) (func(context.Context) error, error) {
 	var exporters []trace.SpanExporter
 
-	// OTLP エクスポーター
-	client := otlptracehttp.NewClient(
-		otlptracehttp.WithEndpoint("otlp-vaxila.mackerelio.com"),
-		otlptracehttp.WithHeaders(map[string]string{
-			"Accept":           "*/*",
-			"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
-		}),
-		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
-	)
-	otlpExporter, err := otlptrace.New(ctx, client)
-	if err != nil {
-		return nil, err
+	// OTLP エクスポーター（環境変数で制御、デフォルトで有効）
+	if os.Getenv("OTEL_DISABLE_OTLP") != "true" {
+		client := otlptracehttp.NewClient(
+			otlptracehttp.WithEndpoint("otlp-vaxila.mackerelio.com"),
+			otlptracehttp.WithHeaders(map[string]string{
+				"Accept":           "*/*",
+				"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
+			}),
+			otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
+			otlptracehttp.WithTimeout(10*time.Second),
+			otlptracehttp.WithRetry(otlptracehttp.RetryConfig{
+				Enabled:         true, // リトライを有効化
+				InitialInterval: 1 * time.Second,
+				MaxInterval:     5 * time.Second,
+				MaxElapsedTime:  30 * time.Second, // 制限エラーの場合は早めに諦める
+			}),
+		)
+		otlpExporter, err := otlptrace.New(ctx, client)
+		if err != nil {
+			log.Printf("Warning: Failed to create OTLP trace exporter: %v", err)
+		} else {
+			exporters = append(exporters, otlpExporter)
+		}
 	}
-	exporters = append(exporters, otlpExporter)
 
 	// コンソール エクスポーター（環境変数で制御）
 	if os.Getenv("OTEL_ENABLE_CONSOLE_OUTPUT") == "true" {
@@ -82,6 +93,18 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 		trace.WithLocalParentNotSampled(trace.NeverSample()),   // ローカルペアレントがサンプルされていない場合はサンプルしない
 	)
 
+	// エクスポーターが一つもない場合はノープエクスポーターを使用
+	if len(exporters) == 0 {
+		log.Println("Warning: No trace exporters configured, using no-op tracer")
+		tp := trace.NewTracerProvider(
+			trace.WithResource(resources),
+			trace.WithSampler(trace.NeverSample()),
+		)
+		otel.SetTracerProvider(tp)
+		otel.SetTextMapPropagator(propagation.TraceContext{})
+		return tp.Shutdown, nil
+	}
+
 	// マルチエクスポーター設定
 	var tpOptions []trace.TracerProviderOption
 	for _, exp := range exporters {
@@ -100,18 +123,28 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 func initMetricProvider(ctx context.Context) (func(context.Context) error, error) {
 	var readers []metric.Reader
 
-	// OTLP メトリクス エクスポーター
-	otlpExporter, err := otlpmetricgrpc.New(ctx,
-		otlpmetricgrpc.WithEndpoint("otlp.mackerelio.com:4317"),
-		otlpmetricgrpc.WithHeaders(map[string]string{
-			"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
-		}),
-		otlpmetricgrpc.WithCompressor("gzip"),
-	)
-	if err != nil {
-		return nil, err
+	// OTLP メトリクス エクスポーター（環境変数で制御、デフォルトで有効）
+	if os.Getenv("OTEL_DISABLE_OTLP") != "true" {
+		otlpExporter, err := otlpmetricgrpc.New(ctx,
+			otlpmetricgrpc.WithEndpoint("otlp.mackerelio.com:4317"),
+			otlpmetricgrpc.WithHeaders(map[string]string{
+				"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
+			}),
+			otlpmetricgrpc.WithCompressor("gzip"),
+			otlpmetricgrpc.WithTimeout(10*time.Second),
+			otlpmetricgrpc.WithRetry(otlpmetricgrpc.RetryConfig{
+				Enabled:         true, // リトライを有効化
+				InitialInterval: 1 * time.Second,
+				MaxInterval:     5 * time.Second,
+				MaxElapsedTime:  30 * time.Second, // 制限エラーの場合は早めに諦める
+			}),
+		)
+		if err != nil {
+			log.Printf("Warning: Failed to create OTLP metric exporter: %v", err)
+		} else {
+			readers = append(readers, metric.NewPeriodicReader(otlpExporter))
+		}
 	}
-	readers = append(readers, metric.NewPeriodicReader(otlpExporter))
 
 	// コンソール メトリクス エクスポーター（環境変数で制御）
 	if os.Getenv("OTEL_ENABLE_CONSOLE_OUTPUT") == "true" {
@@ -136,6 +169,16 @@ func initMetricProvider(ctx context.Context) (func(context.Context) error, error
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	// リーダーが一つもない場合はノープメーターを使用
+	if len(readers) == 0 {
+		log.Println("Warning: No metric readers configured, using no-op meter")
+		mp := metric.NewMeterProvider(
+			metric.WithResource(resources),
+		)
+		otel.SetMeterProvider(mp)
+		return mp.Shutdown, nil
 	}
 
 	// マルチリーダー設定
