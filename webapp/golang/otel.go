@@ -10,6 +10,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -18,6 +20,9 @@ import (
 )
 
 func initTracerProvider(ctx context.Context) (func(context.Context) error, error) {
+	var exporters []trace.SpanExporter
+
+	// OTLP エクスポーター
 	client := otlptracehttp.NewClient(
 		otlptracehttp.WithEndpoint("otlp-vaxila.mackerelio.com"),
 		otlptracehttp.WithHeaders(map[string]string{
@@ -26,9 +31,21 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 		}),
 		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
 	)
-	exporter, err := otlptrace.New(ctx, client)
+	otlpExporter, err := otlptrace.New(ctx, client)
 	if err != nil {
 		return nil, err
+	}
+	exporters = append(exporters, otlpExporter)
+
+	// コンソール エクスポーター（環境変数で制御）
+	if os.Getenv("OTEL_ENABLE_CONSOLE_OUTPUT") == "true" {
+		consoleExporter, err := stdouttrace.New(
+			stdouttrace.WithPrettyPrint(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		exporters = append(exporters, consoleExporter)
 	}
 
 	resources, err := resource.New(
@@ -65,11 +82,15 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 		trace.WithLocalParentNotSampled(trace.NeverSample()),   // ローカルペアレントがサンプルされていない場合はサンプルしない
 	)
 
-	tp := trace.NewTracerProvider(
-		trace.WithBatcher(exporter),
-		trace.WithResource(resources),
-		trace.WithSampler(sampler),
-	)
+	// マルチエクスポーター設定
+	var tpOptions []trace.TracerProviderOption
+	for _, exp := range exporters {
+		tpOptions = append(tpOptions, trace.WithBatcher(exp))
+	}
+	tpOptions = append(tpOptions, trace.WithResource(resources))
+	tpOptions = append(tpOptions, trace.WithSampler(sampler))
+
+	tp := trace.NewTracerProvider(tpOptions...)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
@@ -77,7 +98,10 @@ func initTracerProvider(ctx context.Context) (func(context.Context) error, error
 }
 
 func initMetricProvider(ctx context.Context) (func(context.Context) error, error) {
-	exporter, err := otlpmetricgrpc.New(ctx,
+	var readers []metric.Reader
+
+	// OTLP メトリクス エクスポーター
+	otlpExporter, err := otlpmetricgrpc.New(ctx,
 		otlpmetricgrpc.WithEndpoint("otlp.mackerelio.com:4317"),
 		otlpmetricgrpc.WithHeaders(map[string]string{
 			"Mackerel-Api-Key": os.Getenv("MACKEREL_API_KEY"),
@@ -86,6 +110,18 @@ func initMetricProvider(ctx context.Context) (func(context.Context) error, error
 	)
 	if err != nil {
 		return nil, err
+	}
+	readers = append(readers, metric.NewPeriodicReader(otlpExporter))
+
+	// コンソール メトリクス エクスポーター（環境変数で制御）
+	if os.Getenv("OTEL_ENABLE_CONSOLE_OUTPUT") == "true" {
+		consoleExporter, err := stdoutmetric.New(
+			stdoutmetric.WithPrettyPrint(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		readers = append(readers, metric.NewPeriodicReader(consoleExporter))
 	}
 
 	resources, err := resource.New(
@@ -102,10 +138,14 @@ func initMetricProvider(ctx context.Context) (func(context.Context) error, error
 		return nil, err
 	}
 
-	mp := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(exporter)),
-		metric.WithResource(resources),
-	)
+	// マルチリーダー設定
+	var mpOptions []metric.Option
+	for _, reader := range readers {
+		mpOptions = append(mpOptions, metric.WithReader(reader))
+	}
+	mpOptions = append(mpOptions, metric.WithResource(resources))
+
+	mp := metric.NewMeterProvider(mpOptions...)
 	otel.SetMeterProvider(mp)
 
 	return mp.Shutdown, nil
