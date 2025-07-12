@@ -323,11 +323,13 @@ func makePostsBatch(ctx context.Context, results []Post, csrfToken string, allCo
 	}
 
 	// Batch fetch users
-	userQuery := "SELECT * FROM users WHERE id IN (?" + strings.Repeat(",?", len(uniqueUserIDs)-1) + ")"
 	var users []User
-	err = instrumentedDBSelect(ctx, &users, userQuery, uniqueUserIDs...)
-	if err != nil {
-		return nil, err
+	if len(uniqueUserIDs) > 0 {
+		userQuery := "SELECT * FROM users WHERE id IN (?" + strings.Repeat(",?", len(uniqueUserIDs)-1) + ")"
+		err = instrumentedDBSelect(ctx, &users, userQuery, uniqueUserIDs...)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create user map for quick lookup
@@ -355,7 +357,15 @@ func makePostsBatch(ctx context.Context, results []Post, csrfToken string, allCo
 		p.Comments = comments
 
 		// Set user
-		p.User = userMap[p.UserID]
+		user, exists := userMap[p.UserID]
+		if !exists {
+			// If user not found in batch, fetch individually (fallback to original behavior)
+			err = instrumentedDBGet(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		p.User = user
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
