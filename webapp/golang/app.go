@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -184,8 +185,17 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	// Randomly choose between original and batch implementation (50% probability)
+	if rand.Intn(2) == 0 {
+		return makePostsLoopQuery(ctx, results, csrfToken, allComments)
+	} else {
+		return makePostsBatch(ctx, results, csrfToken, allComments)
+	}
+}
+
+func makePostsLoopQuery(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	tracer := otel.Tracer("private-isu")
-	ctx, span := tracer.Start(ctx, "makePosts")
+	ctx, span := tracer.Start(ctx, "makePostsLoopQuery")
 	defer span.End()
 
 	var posts []Post
@@ -225,6 +235,127 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			return nil, err
 		}
 
+		p.CSRFToken = csrfToken
+
+		if p.User.DelFlg == 0 {
+			posts = append(posts, p)
+		}
+		if len(posts) >= postsPerPage {
+			break
+		}
+	}
+
+	span.SetAttributes(attribute.Int("posts.count", len(posts)))
+	return posts, nil
+}
+
+func makePostsBatch(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	tracer := otel.Tracer("private-isu")
+	ctx, span := tracer.Start(ctx, "makePostsBatch")
+	defer span.End()
+
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
+	var posts []Post
+	var postIDs []interface{}
+	var userIDs []interface{}
+
+	// Collect post IDs and user IDs
+	for _, p := range results {
+		postIDs = append(postIDs, p.ID)
+		userIDs = append(userIDs, p.UserID)
+	}
+
+	// Batch fetch comment counts
+	commentCountQuery := "SELECT post_id, COUNT(*) AS count FROM comments WHERE post_id IN (?" + strings.Repeat(",?", len(postIDs)-1) + ") GROUP BY post_id"
+	var commentCounts []struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	err := instrumentedDBSelect(ctx, &commentCounts, commentCountQuery, postIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create map for quick lookup
+	commentCountMap := make(map[int]int)
+	for _, cc := range commentCounts {
+		commentCountMap[cc.PostID] = cc.Count
+	}
+
+	// Batch fetch comments
+	var commentsQuery string
+	if allComments {
+		commentsQuery = "SELECT * FROM comments WHERE post_id IN (?" + strings.Repeat(",?", len(postIDs)-1) + ") ORDER BY post_id, created_at DESC"
+	} else {
+		// For limited comments, we need to use a subquery or window function
+		commentsQuery = `
+			SELECT * FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments 
+				WHERE post_id IN (` + "?" + strings.Repeat(",?", len(postIDs)-1) + `)
+			) ranked WHERE rn <= 3 ORDER BY post_id, created_at DESC`
+	}
+
+	var allCommentsList []Comment
+	err = instrumentedDBSelect(ctx, &allCommentsList, commentsQuery, postIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect unique user IDs from comments
+	commentUserIDMap := make(map[int]bool)
+	for _, comment := range allCommentsList {
+		commentUserIDMap[comment.UserID] = true
+		userIDs = append(userIDs, comment.UserID)
+	}
+
+	// Remove duplicates from userIDs
+	uniqueUserIDs := make([]interface{}, 0)
+	seen := make(map[int]bool)
+	for _, uid := range userIDs {
+		if id, ok := uid.(int); ok && !seen[id] {
+			seen[id] = true
+			uniqueUserIDs = append(uniqueUserIDs, id)
+		}
+	}
+
+	// Batch fetch users
+	userQuery := "SELECT * FROM users WHERE id IN (?" + strings.Repeat(",?", len(uniqueUserIDs)-1) + ")"
+	var users []User
+	err = instrumentedDBSelect(ctx, &users, userQuery, uniqueUserIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create user map for quick lookup
+	userMap := make(map[int]User)
+	for _, user := range users {
+		userMap[user.ID] = user
+	}
+
+	// Group comments by post_id
+	commentsByPost := make(map[int][]Comment)
+	for _, comment := range allCommentsList {
+		comment.User = userMap[comment.UserID]
+		commentsByPost[comment.PostID] = append(commentsByPost[comment.PostID], comment)
+	}
+
+	// Build final posts
+	for _, p := range results {
+		p.CommentCount = commentCountMap[p.ID]
+
+		// Get comments for this post and reverse order (to match original behavior)
+		comments := commentsByPost[p.ID]
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+		p.Comments = comments
+
+		// Set user
+		p.User = userMap[p.UserID]
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
